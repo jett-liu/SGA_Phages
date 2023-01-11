@@ -9,7 +9,7 @@ Final_SGA_phages.ipynb: Code used to search for Saccharibacteria, Gracilibacteri
   
 Several external databases and files are required including: IMG/VR (Roux et al., 2021), OVD (Li et al., 2022), NCBI nr (Sayers et al., 2021), GVD (Gregory et al., 2020), pVOG (Grazziontin et al., 2017), Earth Virome Phages (Paez-Espino et al. 2016), vContact2 (Bin Jang et al., 2019). 
   
-Genomes and proteins are available in the associated Zenodo repository:
+Genomes, proteins, and associated metadata are available in the associated Zenodo repository:
 []
 
 # Scripts
