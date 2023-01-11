@@ -1,0 +1,291 @@
+#!/usr/bin/ruby -w
+require 'trollop'
+require 'nubio'
+require 'fileutils'
+BBMAP1="/shared/software/.opt/bin/bio/bbmap/bbduk.sh ref=/shared/software/.opt/bin/bio/bbmap/Contaminants/adapters.fa k=23 mink=11 hdist=1 tbo tpe ktrim=r ftm=5"
+BBMAP2="/shared/software/.opt/bin/bio/bbmap/bbduk.sh ref=/shared/software/.opt/bin/bio/bbmap/resources/phix174_ill.ref.fa.gz,/shared/software/.opt/bin/bio/bbmap/Contaminants/Illumina.artifacts.2013.12.fa.gz k=31 hdist=1"
+SICKLE="/shared/software/.opt/bin/bio/sickle pe"
+FQ2FA="/shared/software/.opt/bin/bio/fq2fa"
+PIGZ="/usr/bin/pigz"
+
+HUMANDB=""
+BBMAP3="/shared/software/.opt/bin/bio/bbmap/bbduk.sh ref=/shared/software/.opt/bin/bio/bbmap/resources/phix174_ill.ref.fa.gz,/shared/software/.opt/bin/bio/bbmap/Contaminants/Illumina.artifacts.2013.12.fa.gz k=31 hdist=1"
+
+PROGRAMNAME="process_reads_bbmap.rb"
+
+# defaults
+opts = Trollop::options do
+  version "0.1"
+  banner <<-EOT
+Summary:
+  #{PROGRAMNAME}: Processes JGI reads by trimming adapters and
+                  filtering for PhiX/Illumina contaminants and
+                   ends with sickle quality trimming the reads;
+                  can also create a fasta-formatted, shuffled
+                  output ready for assembly
+
+Synopsis:
+  #{PROGRAMNAME} --basename=<reads base file name; can be shuffled or separate>
+
+Options:
+
+EOT
+  # set options
+  opt :basename,    "read file(s) base name",                                           :type => :string
+  opt :processors,  "number of CPU cores to use",                                       :type => :int, :default => 6
+  opt :run_sickle,  "run sickle quality trimmer",                                       :type => :bool, :default => true
+  opt :sickle_flag, "if running sickle, set type flag",                                 :type => :string, :default => "sanger", :short => "-k"
+  opt :create_fa,   "create fasta file for assembly",                                   :type => :bool, :default => false
+  opt :mask_human,  "remove reads mapping to humans (only for microbiomes)",            :type => :bool, :default => false
+  opt :humandb,     "database to use for human masking",                                :type => :string, :default => HUMANDB, :short => "-d"
+  opt :shuffled,    "input is already shuffled",                                        :type => :bool, :default => false
+  opt :zipped,      "input is zipped",                                                  :type => :bool, :default => false
+  opt :dry_run,     "Don't actually run anything, just report",                         :type => :bool, :default => false
+  opt :verbose,     "show extra progress information",                                  :type => :bool, :default => false
+end
+
+Trollop::die :basename, "is required" unless opts[:basename]
+
+# dry_run assumes verbose
+opts[:verbose] = true if opts[:dry_run] == true
+
+# make sure files exist
+if (File.exist?("#{opts[:basename]}.fastq") or File.exist?("#{opts[:basename]}.fastq.gz"))
+  opts[:shuffled] = true
+
+  if File.exist? "#{opts[:basename]}.fastq"
+    opts[:in] = "#{opts[:basename]}.fastq"
+    opts[:out] = "#{opts[:basename]}_trim.fastq"
+    opts[:clean_out] = "#{opts[:basename]}_trim_clean.fastq"
+    opts[:sickle_pe_out] = "#{opts[:basename]}_trim_clean.PE.fastq"
+    opts[:sickle_sr_out] = "#{opts[:basename]}_trim_clean.SR.fastq"
+  else
+    opts[:zipped] = true
+    opts[:in] = "#{opts[:basename]}.fastq.gz"
+    opts[:out] = "#{opts[:basename]}_trim.fastq.gz"
+    opts[:clean_out] = "#{opts[:basename]}_trim_clean.fastq.gz"
+    opts[:clean_out_nogz] = "#{opts[:basename]}_trim_clean.fastq"
+    opts[:sickle_pe_out] = "#{opts[:basename]}_trim_clean.PE.fastq.gz"
+    opts[:sickle_pe_out_nogz] = "#{opts[:basename]}_trim_clean.PE.fastq"
+    opts[:sickle_sr_out] = "#{opts[:basename]}_trim_clean.SR.fastq.gz"
+    opts[:sickle_sr_out_nogz] = "#{opts[:basename]}_trim_clean.SR.fastq"
+  end
+elsif ( (File.exist?("#{opts[:basename]}.1.fastq") or File.exist?("#{opts[:basename]}.1.fastq.gz")) &&
+        (File.exist?("#{opts[:basename]}.2.fastq") or File.exist?("#{opts[:basename]}.2.fastq.gz")) )
+  opts[:shuffled] = false
+
+  if File.exist?("#{opts[:basename]}.1.fastq")
+    opts[:in1] = "#{opts[:basename]}.1.fastq"
+    opts[:out1] = "#{opts[:basename]}_trim.1.fastq"
+    opts[:clean_out1] = "#{opts[:basename]}_trim_clean.1.fastq"
+    opts[:sickle_pe_out1] = "#{opts[:basename]}_trim_clean.PE.1.fastq"
+    opts[:sickle_sr_out] = "#{opts[:basename]}_trim_clean.SR.fastq"
+  else
+    opts[:zipped] = true
+    opts[:in1] = "#{opts[:basename]}.1.fastq.gz"
+    opts[:out1] = "#{opts[:basename]}_trim.1.fastq.gz"
+    opts[:clean_out1] = "#{opts[:basename]}_trim_clean.1.fastq.gz"
+    opts[:clean_out1_nogz] = "#{opts[:basename]}_trim_clean.1.fastq"
+    opts[:sickle_pe_out1] = "#{opts[:basename]}_trim_clean.PE.1.fastq.gz"
+    opts[:sickle_pe_out1_nogz] = "#{opts[:basename]}_trim_clean.PE.1.fastq"
+    opts[:sickle_sr_out] = "#{opts[:basename]}_trim_clean.SR.fastq.gz"
+  end
+
+  if File.exist?("#{opts[:basename]}.2.fastq")
+    opts[:in2] = "#{opts[:basename]}.2.fastq"
+    opts[:out2] = "#{opts[:basename]}_trim.2.fastq"
+    opts[:clean_out2] = "#{opts[:basename]}_trim_clean.2.fastq"
+    opts[:sickle_pe_out2] = "#{opts[:basename]}_trim_clean.PE.2.fastq"
+  else
+    opts[:zipped] = true
+    opts[:in2] = "#{opts[:basename]}.2.fastq.gz"
+    opts[:out2] = "#{opts[:basename]}_trim.2.fastq.gz"
+    opts[:clean_out2] = "#{opts[:basename]}_trim_clean.2.fastq.gz"
+    opts[:clean_out2_nogz] = "#{opts[:basename]}_trim_clean.2.fastq"
+    opts[:sickle_pe_out2] = "#{opts[:basename]}_trim_clean.PE.2.fastq.gz"
+    opts[:sickle_pe_out2_nogz] = "#{opts[:basename]}_trim_clean.PE.2.fastq"
+    # don't need to redefine SR out - only one is needed
+  end
+else
+  $stderr.puts "ERROR: missing input, or files are irrecognizable"
+  $stderr.puts "       Can't find #{opts[:basename]}.fastq or a gzip'd version,"
+  $stderr.puts "       or #{opts[:basename]}.[12].fastq or gzip'd versions"
+  Trollop::die :basename, "is required"
+end
+
+if opts[:create_fa]
+  if opts[:run_sickle]
+    opts[:fa_out] = "#{opts[:basename]}_trim_clean.PE.fa"
+  else
+    opts[:fa_out] = "#{opts[:basename]}_trim_clean.fa"
+  end
+end
+
+if opts[:shuffled]
+  if opts[:verbose]
+    $stderr.puts "Running BBMap stage 1: \n  #{BBMAP1} t=#{opts[:processors]} -in=#{opts[:in]} -out=#{opts[:out]}"
+  end
+  unless opts[:dry_run]
+    %x{ #{BBMAP1} t=#{opts[:processors]} -in=#{opts[:in]} -out=#{opts[:out]} }
+  end
+
+  if opts[:verbose]
+    $stderr.puts "Running BBMap stage 2: \n  #{BBMAP2} t=#{opts[:processors]} -in=#{opts[:out]} -out=#{opts[:clean_out]}"
+  end
+  unless opts[:dry_run]
+    %x{ #{BBMAP2} t=#{opts[:processors]} -in=#{opts[:out]} -out=#{opts[:clean_out]} }
+  end
+
+  if opts[:run_sickle]
+    cmd="#{SICKLE} -t #{opts[:sickle_flag]} -c #{opts[:clean_out]}"
+    if opts[:zipped]
+      if opts[:create_fa] # don't zip if we need to unzip later for fa creation
+        cmd += " -m #{opts[:sickle_pe_out_nogz]} -s #{opts[:sickle_sr_out]}"
+      else
+        cmd += " -m #{opts[:sickle_pe_out_nogz]} -s #{opts[:sickle_sr_out_nogz]}"
+        cmd += "&& pigz -p #{opts[:processors]} #{opts[:sickle_pe_out_nogz]}"
+        cmd += "&& pigz -p #{opts[:processors]} #{opts[:sickle_sr_out_nogz]}"
+      end
+    else
+      # confusing: you would think this should be a "_nogz", but the
+      # input wasn't gzip'd.  So, this file name actually refers to to
+      # the unzipped input
+      cmd += " -m #{opts[:sickle_pe_out]} -s #{opts[:sickle_sr_out]}"
+    end
+    if opts[:verbose]
+      $stderr.puts "Running sickle: \n  #{cmd}"
+    end
+    unless opts[:dry_run]
+      %x{ #{cmd} }
+    end
+  end
+
+  if opts[:create_fa]
+    if opts[:run_sickle]
+      if opts[:zipped]
+        if opts[:verbose]
+          $stderr.puts "Creating fasta from sickle output:"
+          $stderr.puts "  #{FQ2FA} --paired #{opts[:sickle_pe_out_nogz]} #{opts[:fa_out]}"
+          $stderr.puts "  #{PIGZ} -p #{opts[:processors]} #{opts[:sickle_pe_out_nogz]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{FQ2FA} --paired #{opts[:sickle_pe_out_nogz]} #{opts[:fa_out]} }
+          %x{ #{PIGZ} -p #{opts[:processors]} #{opts[:sickle_pe_out_nogz]} }
+        end
+      else
+        if opts[:verbose]
+          $stderr.puts "Creating fasta sickle output: \n  #{FQ2FA} --paired #{opts[:sickle_pe_out]} #{opts[:fa_out]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{FQ2FA} --paired #{opts[:sickle_pe_out]} #{opts[:fa_out]} }
+        end
+      end
+    else
+      if opts[:zipped]
+        if opts[:verbose]
+          $stderr.puts "Creating fasta from BBMap gzip'd output:"
+          $stderr.puts "  #{PIGZ} -d #{opts[:clean_out]}"
+          $stderr.puts "  #{FQ2FA} --paired #{opts[:clean_out_nogz]} #{opts[:fa_out]}"
+          $stderr.puts "  #{PIGZ} -p #{opts[:processors]} #{opts[:clean_out_nogz]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{PIGZ} -d #{opts[:clean_out]}}
+          %x{ #{FQ2FA} --paired #{opts[:clean_out_nogz]} #{opts[:fa_out]} }
+          %x{ #{PIGZ} -p #{opts[:processors]} #{opts[:clean_out_nogz]} }
+        end
+      else
+        if opts[:verbose]
+          $stderr.puts "Creating fasta from BBMap output: \n  #{FQ2FA} --paired #{opts[:clean_out]} #{opts[:fa_out]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{FQ2FA} --paired #{opts[:clean_out]} #{opts[:fa_out]} }
+        end
+      end
+    end
+  end
+else
+  # not shuffled
+  if opts[:verbose]
+    $stderr.puts "Running BBMap stage 1: \n  #{BBMAP1} t=#{opts[:processors]} -in1=#{opts[:in1]} -in2=#{opts[:in2]} -out1=#{opts[:out1]} -out2=#{opts[:out2]}"
+  end
+  unless opts[:dry_run]
+    %x{ #{BBMAP1} t=#{opts[:processors]} -in1=#{opts[:in1]} -in2=#{opts[:in2]} -out1=#{opts[:out1]} -out2=#{opts[:out2]}}
+  end
+
+  if opts[:verbose]
+    $stderr.puts "Running BBMap stage 2: \n  #{BBMAP2} t=#{opts[:processors]} -in1=#{opts[:out1]} -in2=#{opts[:out2]} -out1=#{opts[:clean_out1]} -out2=#{opts[:clean_out2]}"
+  end
+  unless opts[:dry_run]
+    %x{ #{BBMAP2} t=#{opts[:processors]} -in1=#{opts[:out1]} -in2=#{opts[:out2]} -out1=#{opts[:clean_out1]} -out2=#{opts[:clean_out2]} }
+  end
+
+  if opts[:run_sickle]
+    cmd="#{SICKLE} -t #{opts[:sickle_flag]} -f #{opts[:clean_out1]} -r #{opts[:clean_out2]}"
+    if opts[:zipped]
+      if opts[:create_fa]
+        cmd += " -o #{opts[:sickle_pe_out1_nogz]} -p #{opts[:sickle_pe_out2_nogz]} -s #{opts[:sickle_sr_out]}"
+      else
+        cmd += " -o #{opts[:sickle_pe_out1_nogz]} -p #{opts[:sickle_pe_out2_nogz]} -s #{opts[:sickle_sr_out]} && pigz -p #{opts[:processors]} #{opts[:sickle_pe_out1_nogz]} #{opts[:sickle_pe_out2_nogz]}"
+      end
+    else
+      cmd += " -o #{opts[:sickle_pe_out1]} -p #{opts[:sickle_pe_out2]} -s #{opts[:sickle_sr_out]}"
+    end
+    if opts[:verbose]
+      $stderr.puts "Running sickle: \n  #{cmd}"
+    end
+    unless opts[:dry_run]
+      %x{ #{cmd} }
+    end
+  end
+
+  if opts[:create_fa]
+    if opts[:run_sickle]
+      if opts[:zipped]
+        if opts[:verbose]
+          $stderr.puts "Creating fasta from merging sickle output:"
+          $stderr.puts "  #{FQ2FA} --merge #{opts[:sickle_pe_out1_nogz]} #{opts[:sickle_pe_out2_nogz]} #{opts[:fa_out]}"
+          $stderr.puts "  #{PIGZ} -p #{opts[:processors]} #{opts[:sickle_pe_out1_nogz]}"
+          $stderr.puts "  #{PIGZ} -p #{opts[:processors]} #{opts[:sickle_pe_out2_nogz]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{FQ2FA} --merge #{opts[:sickle_pe_out1_nogz]} #{opts[:sickle_pe_out2_nogz]} #{opts[:fa_out]} }
+          %x{ #{PIGZ} -p #{opts[:processors]} #{opts[:sickle_pe_out1_nogz]} }
+          %x{ #{PIGZ} -p #{opts[:processors]} #{opts[:sickle_pe_out2_nogz]} }
+        end
+      else
+        if opts[:verbose]
+          $stderr.puts "Creating fasta sickle output from unzipped input:"
+          $stderr.puts "#{FQ2FA} --merge #{opts[:sickle_pe_out1]} #{opts[:sickle_pe_out2]} #{opts[:fa_out]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{FQ2FA} --merge #{opts[:sickle_pe_out1]} #{opts[:sickle_pe_out2]} #{opts[:fa_out]} }
+        end
+      end
+    else # no sickle
+      if opts[:zipped]
+        if opts[:verbose]
+          $stderr.puts "Creating fasta from BBMap gzip'd output:"
+          $stderr.puts "  #{PIGZ} -d #{opts[:clean_out1]}"
+          $stderr.puts "  #{PIGZ} -d #{opts[:clean_out2]}"
+          $stderr.puts "  #{FQ2FA} --merge #{opts[:clean_out1_nogz]} #{opts[:clean_out2_nogz]} #{opts[:fa_out]}"
+          $stderr.puts "  #{PIGZ} -p #{opts[:processors]} #{opts[:clean_out1_nogz]}"
+          $stderr.puts "  #{PIGZ} -p #{opts[:processors]} #{opts[:clean_out2_nogz]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{PIGZ} -d #{opts[:clean_out1]}}
+          %x{ #{PIGZ} -d #{opts[:clean_out2]}}
+          %x{ #{FQ2FA} --merge #{opts[:clean_out1_nogz]} #{opts[:clean_out2_nogz]} #{opts[:fa_out]} }
+          %x{ #{PIGZ} -p #{opts[:processors]} #{opts[:clean_out1_nogz]} }
+          %x{ #{PIGZ} -p #{opts[:processors]} #{opts[:clean_out2_nogz]} }
+        end
+      else
+        if opts[:verbose]
+          $stderr.puts "Creating fasta from BBMap output: \n  #{FQ2FA} --merge #{opts[:clean_out1]} #{opts[:clean_out2]} #{opts[:fa_out]}"
+        end
+        unless opts[:dry_run]
+          %x{ #{FQ2FA} --merge #{opts[:clean_out1]} #{opts[:clean_out2]} #{opts[:fa_out]} }
+        end
+      end
+    end
+  end
+end
